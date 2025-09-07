@@ -34,7 +34,7 @@ app.get("/api/mann", async (req, res) => {
     if (!qRaw) return res.status(400).json({ error: "Falta parámetro q" });
 
     const page = Number.parseInt(req.query.page || "1", 10) || 1;
-    const size = Number.parseInt(req.query.size || "15", 10) || 15;
+    const size = Number.parseInt(req.query.size || "30", 10) || 30;
     const filterBy = String(req.query.filterBy || "ALL_FILTER");
 
     // Normalizar como vimos que hace el sitio: espacios -> + y lower
