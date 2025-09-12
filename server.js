@@ -1,4 +1,5 @@
  // server.js
+// server.js
 const express = require("express");
 const cors = require("cors");
 // Para Node < 18, descomenta y agrega la dependencia:
@@ -199,8 +200,7 @@ app.get("/api/img", async (req, res) => {
         headers: {
           "User-Agent": "Mozilla/5.0",
           "Referer": "https://www.mann-filter.com/",
-          "Accept":
-            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+          "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         },
       },
       12000
@@ -210,12 +210,14 @@ app.get("/api/img", async (req, res) => {
       return res.status(r.status).send("Error cargando imagen");
     }
 
-    const contentType = r.headers.get("content-type") || "image/jpeg";
     const buf = Buffer.from(await r.arrayBuffer());
 
-    // ► Mejora: forzar 200 y tipo binario correcto
+    // Desactivar cache condicional y forzar 200 con binario
+    res.removeHeader("ETag");
+    res.removeHeader("Last-Modified");
+
     res.status(200);
-    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Type", r.headers.get("content-type") || "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.setHeader("X-Proxy-Upstream", url.hostname);
     res.send(buf);
