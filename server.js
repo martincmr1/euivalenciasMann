@@ -7,6 +7,9 @@ const cors = require("cors");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Desactivar ETag global para evitar 304 condicionales
+app.set("etag", false);
+
 /* =========================
  *  CORS
  * ========================= */
@@ -15,7 +18,7 @@ app.use(
     origin:
       process.env.NODE_ENV === "production"
         ? [
-            // ⚠️ Cambia esto por el dominio real de tu front
+            // ⚠️ Cambiá esto por el dominio real de tu front
             "https://presupuestador-boxes.vercel.app",
           ]
         : true,
@@ -192,6 +195,8 @@ app.get("/api/img", async (req, res) => {
     if (!ALLOWED_IMG_HOSTS.has(url.hostname)) {
       return res.status(400).send("Host no permitido");
     }
+
+    console.log("[IMG] hit:", u); // diagnóstico
 
     const r = await fetchWithTimeout(
       u,
