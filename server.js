@@ -1,4 +1,3 @@
- // server.js
 // server.js
 const express = require("express");
 const cors = require("cors");
@@ -177,7 +176,7 @@ app.get("/api/wix", async (req, res) => {
 });
 
 /* =========================
- *  Imagen proxy (mejora)
+ *  Imagen proxy (mejora: forzar Content-Type imagen y 200)
  * ========================= */
 const ALLOWED_IMG_HOSTS = new Set([
   "www.mann-hummel.com",
@@ -211,13 +210,14 @@ app.get("/api/img", async (req, res) => {
     }
 
     const buf = Buffer.from(await r.arrayBuffer());
+    const contentType = r.headers.get("content-type") || "image/jpeg";
 
-    // Desactivar cache condicional y forzar 200 con binario
+    // Desactivamos cache condicional y devolvemos siempre binario con 200
     res.removeHeader("ETag");
     res.removeHeader("Last-Modified");
 
     res.status(200);
-    res.setHeader("Content-Type", r.headers.get("content-type") || "image/jpeg");
+    res.setHeader("Content-Type", contentType);
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.setHeader("X-Proxy-Upstream", url.hostname);
     res.send(buf);
