@@ -66,7 +66,6 @@ const MANN_ENDPOINT = "https://www.mann-filter.com/api/graphql/catalog-prod";
 const MANN_QUERY =
   "query($search:String!$currentPage:Int!$pageSize:Int!$filterBy:TYPE_OF_FILTER){catalogSearch:search_crossreference_no(search:$search currentPage:$currentPage pageSize:$pageSize filterBy:$filterBy){availableFilters:available_filters{label totalProducts:total_products code __typename}items{product{name sku urlKey:url_key attributes:attributes_value{key value adminValue:admin_value __typename}references{referenceTypeId:reference_type_id referenceTypeName:reference_type_name referenceTypeDescription:reference_type_description referenceProducts:reference_products{salesDesignation:sales_designation urlKey:url_key __typename}__typename}__typename}externalNumber:external_number intProductIdentifier:int_product_identifier externalProductName:ext_product_name manufacturer:ext_brand_name filterBy:aa_product_family __typename}pageInfo:page_info{currentPage:current_page pageSize:page_size totalPages:total_pages __typename}totalCount:total_count __typename}}";
 
-
 app.get("/api/mann", async (req, res) => {
   try {
     const qRaw = String(req.query.q || "").trim();
@@ -173,6 +172,49 @@ app.get("/api/wix", async (req, res) => {
     console.error("[WIX]  ERROR:", e);
     res.setHeader("X-Proxy-Upstream", "wixfilters.com");
     res.status(500).json({ error: e?.message || "Proxy error (WIX)" });
+  }
+});
+
+/* =========================
+ *  Imagen proxy (mejora)
+ * ========================= */
+const ALLOWED_IMG_HOSTS = new Set([
+  "www.mann-hummel.com",
+  "mann-hummel.com",
+]);
+
+app.get("/api/img", async (req, res) => {
+  try {
+    const u = String(req.query.u || "");
+    if (!u) return res.status(400).send("Falta parámetro u");
+
+    const url = new URL(u);
+    if (!ALLOWED_IMG_HOSTS.has(url.hostname)) {
+      return res.status(400).send("Host no permitido");
+    }
+
+    const r = await fetchWithTimeout(
+      u,
+      {
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          "Referer": "https://www.mann-filter.com/",
+          "Accept":
+            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        },
+      },
+      12000
+    );
+
+    const contentType = r.headers.get("content-type") || "image/jpeg";
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("X-Proxy-Upstream", url.hostname);
+    res.status(r.status).send(buf);
+  } catch (e) {
+    console.error("[IMG] ERROR:", e);
+    res.status(500).send("Proxy de imagen: error");
   }
 });
 
