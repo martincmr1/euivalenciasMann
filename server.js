@@ -72,7 +72,7 @@ app.get("/api/mann", async (req, res) => {
     if (!qRaw) return res.status(400).json({ error: "Falta parámetro q" });
 
     const page = Number.parseInt(req.query.page || "1", 10) || 1;
-    const pageSize = 30; // tamaño fijo
+    const pageSize = 100; // tamaño fijo
     const filterBy = normFilter(req.query.filterBy);
 
     const variables = {
