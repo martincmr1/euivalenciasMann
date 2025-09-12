@@ -105,7 +105,7 @@ app.get("/api/mann", async (req, res) => {
     const body = await r.text();
     res.setHeader("X-Proxy-Upstream", "mann-filter.com");
     res.setHeader("X-From-Proxy-Route", "/api/mann");
-    res.setHeader("Cache-Control", "public, max-age=30");
+    res.setHeader("Cache-Control", "public, max-age=100");
     res
       .status(r.status)
       .type(r.headers.get("content-type") || "application/json")
