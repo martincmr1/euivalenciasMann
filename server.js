@@ -206,12 +206,19 @@ app.get("/api/img", async (req, res) => {
       12000
     );
 
+    if (!r.ok) {
+      return res.status(r.status).send("Error cargando imagen");
+    }
+
     const contentType = r.headers.get("content-type") || "image/jpeg";
     const buf = Buffer.from(await r.arrayBuffer());
+
+    // ► Mejora: forzar 200 y tipo binario correcto
+    res.status(200);
     res.setHeader("Content-Type", contentType);
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.setHeader("X-Proxy-Upstream", url.hostname);
-    res.status(r.status).send(buf);
+    res.send(buf);
   } catch (e) {
     console.error("[IMG] ERROR:", e);
     res.status(500).send("Proxy de imagen: error");
