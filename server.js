@@ -1,4 +1,5 @@
  // server.js
+// server.js
 const express = require("express");
 const cors = require("cors");
 // Para Node < 18, descomenta y agrega la dependencia:
@@ -233,8 +234,12 @@ app.get("/api/img", async (req, res) => {
 });
 
 /* =========================
- *  Start
+ *  Export para Vercel (serverless) y listen local
  * ========================= */
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en http://localhost:${PORT}`);
-});
+module.exports = app;
+
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Servidor escuchando en http://localhost:${PORT}`);
+  });
+}
