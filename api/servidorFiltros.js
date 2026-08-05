@@ -1,5 +1,5 @@
 /**
- * servicorFiltros.js
+ * servidorFiltros.js
  *
  * Función serverless para Vercel que consulta el catálogo de MANN-FILTER.
  *
@@ -15,6 +15,8 @@
  *   GET  ?action=models&brandId=00000000000019&categoryId=
  *   GET  ?action=versions&modelId=00000000007390
  *   GET  ?action=filters&vehicleTypeId=00000000191521&filterBy=ALL_FILTER
+ *   GET  ?action=images&mannCode=C%202646&mannCode=W%20930%2F20&width=600
+ *   POST action=images
  *   POST action=resolve
  *
  * POST /api/servicorFiltros?action=resolve
@@ -36,6 +38,9 @@
 
 const MANN_ENDPOINT =
   "https://www.mann-filter.com/api/graphql/catalog-prod";
+
+const MANN_ASSETS_ENDPOINT =
+  "https://www.mann-filter.com/bin/assets.json";
 
 const MANN_STORE =
   process.env.MANN_STORE || "pcat_mf_ar_store_es";
@@ -234,6 +239,9 @@ export default async function handler(req, res) {
       case "filters":
         return await handleFilters(req, res);
 
+      case "images":
+        return await handleImages(req, res);
+
       case "resolve":
         return await handleResolve(req, res);
 
@@ -247,6 +255,7 @@ export default async function handler(req, res) {
             "models",
             "versions",
             "filters",
+            "images",
             "resolve"
           ]
         });
@@ -430,6 +439,89 @@ async function handleFilters(req, res) {
     availableFilters: catalog.availableFilters,
     pageInfo: catalog.pageInfo,
     filters: catalog.filters
+  });
+}
+
+
+async function handleImages(req, res) {
+  const body = parseBody(req);
+
+  const queryCodes = getRepeatedQueryParam(
+    req,
+    "mannCode"
+  );
+
+  const bodyCodes = [
+    ...asArray(body.mannCodes),
+    ...asArray(body.codes),
+    ...asArray(body.productReferences)
+  ];
+
+  const singleBodyCode = cleanString(
+    body.mannCode || body.code
+  );
+
+  const rawCodes = [
+    ...queryCodes,
+    ...bodyCodes,
+    ...(singleBodyCode
+      ? [singleBodyCode]
+      : [])
+  ];
+
+  const mannCodes = uniqueStrings(
+    rawCodes
+      .flatMap((value) =>
+        String(value || "")
+          .split(",")
+          .map((item) => item.trim())
+      )
+      .filter(Boolean)
+  );
+
+  if (!mannCodes.length) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Falta mannCode. Podés enviarlo varias veces en la URL o usar mannCodes en el cuerpo."
+    });
+  }
+
+  const width = clamp(
+    positiveInteger(
+      getParam(req, "width") || body.width,
+      600
+    ),
+    100,
+    2000
+  );
+
+  const images = await getMannImages(
+    mannCodes,
+    width
+  );
+
+  const found = [];
+  const missing = [];
+
+  for (const mannCode of mannCodes) {
+    const image = images[mannCode];
+
+    if (image?.imageUrl) {
+      found.push(image);
+    } else {
+      missing.push(mannCode);
+    }
+  }
+
+  return res.status(200).json({
+    ok: true,
+    width,
+    requested: mannCodes.length,
+    total: found.length,
+    images,
+    found,
+    missing
   });
 }
 
@@ -649,6 +741,332 @@ async function getFilterPage(
       catalog.totalCount || filters.length
     )
   };
+}
+
+
+async function getMannImages(
+  mannCodes,
+  width = 600
+) {
+  const uniqueCodes = uniqueStrings(
+    mannCodes
+      .map(cleanString)
+      .filter(Boolean)
+  );
+
+  if (!uniqueCodes.length) {
+    return {};
+  }
+
+  /*
+   * La API de assets admite varias referencias repetidas.
+   * Se consultan en lotes para evitar URLs excesivamente largas.
+   */
+  const batches = chunkArray(uniqueCodes, 20);
+  const allHits = [];
+
+  for (const batch of batches) {
+    const hits = await fetchMannAssetBatch(batch);
+    allHits.push(...hits);
+  }
+
+  const result = {};
+
+  for (const mannCode of uniqueCodes) {
+    const hit = findBestAssetHit(
+      allHits,
+      mannCode
+    );
+
+    result[mannCode] = hit
+      ? normalizeAssetHit(
+          hit,
+          mannCode,
+          width
+        )
+      : {
+          mannCode,
+          imageUrl: "",
+          found: false
+        };
+  }
+
+  return result;
+}
+
+async function fetchMannAssetBatch(
+  mannCodes
+) {
+  const url = new URL(MANN_ASSETS_ENDPOINT);
+
+  url.searchParams.set("metaData", "true");
+  url.searchParams.set(
+    "brand",
+    "MANN-FILTER"
+  );
+  url.searchParams.set(
+    "productView",
+    "Front"
+  );
+  url.searchParams.set(
+    "productDimensionAsset",
+    "No"
+  );
+  url.searchParams.set(
+    "productRelatedAssetType",
+    "Product Image"
+  );
+  url.searchParams.set(
+    "mainImage",
+    "true"
+  );
+
+  for (const mannCode of mannCodes) {
+    const reference =
+      buildMannProductReference(mannCode);
+
+    if (reference) {
+      url.searchParams.append(
+        "productReferences",
+        reference
+      );
+    }
+  }
+
+  url.searchParams.set(
+    "limit",
+    String(
+      Math.max(
+        25,
+        mannCodes.length * 3
+      )
+    )
+  );
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    REQUEST_TIMEOUT_MS
+  );
+
+  let response;
+
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Referer: MANN_REFERER,
+        "User-Agent":
+          "Mozilla/5.0 (compatible; Boxes-MANN-Service/1.1)"
+      },
+      signal: controller.signal,
+      next: {
+        revalidate: 86400
+      }
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(
+        "La consulta de imágenes a MANN excedió el tiempo máximo"
+      );
+      timeoutError.statusCode = 504;
+      throw timeoutError;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    const error = new Error(
+      `MANN Assets respondió HTTP ${response.status}: ${text.slice(
+        0,
+        500
+      )}`
+    );
+    error.statusCode = 502;
+    throw error;
+  }
+
+  let payload;
+
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    const error = new Error(
+      "MANN Assets no devolvió un JSON válido"
+    );
+    error.statusCode = 502;
+    throw error;
+  }
+
+  if (payload?.successful === false) {
+    const error = new Error(
+      cleanString(payload?.reason) ||
+        "MANN Assets rechazó la consulta"
+    );
+    error.statusCode = 502;
+    throw error;
+  }
+
+  return asArray(payload?.hits);
+}
+
+function findBestAssetHit(
+  hits,
+  mannCode
+) {
+  const target =
+    normalizeAssetReference(mannCode);
+
+  const matching = asArray(hits).filter(
+    (hit) => {
+      const references = asArray(
+        hit?.metaData?.productReferences
+      );
+
+      return references.some(
+        (reference) =>
+          normalizeAssetReference(
+            reference
+          ) === target
+      );
+    }
+  );
+
+  return (
+    matching.find(
+      (hit) =>
+        isTrueValue(
+          hit?.metaData?.mainImage
+        ) &&
+        cleanString(
+          hit?.metaData?.productView
+        ).toLowerCase() === "front"
+    ) ||
+    matching.find((hit) =>
+      isTrueValue(
+        hit?.metaData?.mainImage
+      )
+    ) ||
+    matching[0] ||
+    null
+  );
+}
+
+function normalizeAssetHit(
+  hit,
+  mannCode,
+  width
+) {
+  const uriTemplate = cleanString(
+    hit?.uriTemplate
+  );
+
+  const scene7File = cleanString(
+    hit?.metaData?.["dam:scene7File"]
+  );
+
+  const scene7Domain = cleanString(
+    hit?.metaData?.["dam:scene7Domain"]
+  );
+
+  let imageUrl = "";
+
+  if (uriTemplate) {
+    imageUrl = uriTemplate.replace(
+      "{width}",
+      String(width)
+    );
+  } else if (
+    scene7File &&
+    scene7Domain
+  ) {
+    imageUrl =
+      `${scene7Domain.replace(/\/+$/, "")}` +
+      `/is/image/${scene7File}` +
+      `?wid=${width}&fit=constrain`;
+  }
+
+  return {
+    mannCode,
+    found: Boolean(imageUrl),
+    imageUrl,
+    uriTemplate,
+    link: cleanString(hit?.link),
+    mimeType: cleanString(
+      hit?.mimeType
+    ),
+    width: numberOrNull(
+      hit?.dimension?.width
+    ),
+    height: numberOrNull(
+      hit?.dimension?.height
+    ),
+    title: firstNonEmpty([
+      hit?.metaData?.["jcr:title"],
+      hit?.metaData?.["dc:title"]
+    ]),
+    productView: cleanString(
+      hit?.metaData?.productView
+    ),
+    mainImage: isTrueValue(
+      hit?.metaData?.mainImage
+    ),
+    scene7File,
+    productReferences: asArray(
+      hit?.metaData?.productReferences
+    )
+  };
+}
+
+function buildMannProductReference(
+  mannCode
+) {
+  const code = cleanString(mannCode)
+    .toUpperCase()
+    .replace(/\s+/g, "");
+
+  return code
+    ? `${code}_MANN-FILTER`
+    : "";
+}
+
+function normalizeAssetReference(
+  value = ""
+) {
+  return String(value)
+    .toUpperCase()
+    .replace(/_MANN-FILTER$/i, "")
+    .replace(/[^A-Z0-9]/g, "")
+    .trim();
+}
+
+function isTrueValue(value) {
+  return (
+    value === true ||
+    String(value).toLowerCase() === "true"
+  );
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+
+  for (
+    let index = 0;
+    index < items.length;
+    index += size
+  ) {
+    chunks.push(
+      items.slice(index, index + size)
+    );
+  }
+
+  return chunks;
 }
 
 async function mannGraphql(
@@ -1284,6 +1702,28 @@ function getParam(req, key) {
   const body = parseBody(req);
 
   return body?.[key];
+}
+
+
+function getRepeatedQueryParam(
+  req,
+  key
+) {
+  const value = req?.query?.[key];
+
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (
+    value !== undefined &&
+    value !== null &&
+    String(value).trim()
+  ) {
+    return [value];
+  }
+
+  return [];
 }
 
 function requireParam(req, key) {
