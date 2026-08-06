@@ -27,7 +27,7 @@
  *       "codigo": "13541",
  *       "descripcion": "FILTRO ACEITE MANN W 712/73",
  *       "precio": 15800,
- *       "equivalencias": ["W 712/73"]
+ *       "
  *     }
  *   ]
  * }
