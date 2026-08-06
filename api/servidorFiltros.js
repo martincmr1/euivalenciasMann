@@ -42,6 +42,24 @@ const MANN_ENDPOINT =
 const MANN_ASSETS_ENDPOINT =
   "https://www.mann-filter.com/bin/assets.json";
 
+/*
+ * Respaldo directo de Adobe Scene7 / Dynamic Media.
+ * Ejemplo válido:
+ * https://s7g10.scene7.com/is/image/mannhummel/W_940.1-1
+ */
+const MANN_SCENE7_BASE =
+  process.env.MANN_SCENE7_BASE ||
+  "https://s7g10.scene7.com/is/image/mannhummel";
+
+const MANN_SCENE7_QUALITY = clamp(
+  positiveInteger(
+    process.env.MANN_SCENE7_QUALITY,
+    82
+  ),
+  1,
+  100
+);
+
 const MANN_STORE =
   process.env.MANN_STORE || "pcat_mf_ar_store_es";
 
@@ -477,6 +495,11 @@ async function handleImages(req, res) {
           .map((item) => item.trim())
       )
       .filter(Boolean)
+      .filter(
+        (mannCode) =>
+          normalizeFilterCode(mannCode) !==
+          "NOFILTER"
+      )
   );
 
   if (!mannCodes.length) {
@@ -709,7 +732,9 @@ async function getFilterPage(
   }
 
   const filters = Array.isArray(catalog.items)
-    ? catalog.items.map(normalizeFilter)
+    ? catalog.items
+        .map(normalizeFilter)
+        .filter(isValidCatalogFilter)
     : [];
 
   return {
@@ -752,6 +777,11 @@ async function getMannImages(
     mannCodes
       .map(cleanString)
       .filter(Boolean)
+      .filter(
+        (mannCode) =>
+          normalizeFilterCode(mannCode) !==
+          "NOFILTER"
+      )
   );
 
   if (!uniqueCodes.length) {
@@ -759,8 +789,16 @@ async function getMannImages(
   }
 
   /*
-   * La API de assets admite varias referencias repetidas.
-   * Se consultan en lotes para evitar URLs excesivamente largas.
+   * Primera estrategia:
+   * consulta oficial a /bin/assets.json.
+   *
+   * Segunda estrategia:
+   * si el asset no aparece allí, se intenta localizarlo
+   * directamente en Adobe Scene7 utilizando el patrón
+   * real de MANN, por ejemplo:
+   *
+   * W 940/1  -> W_940.1-1
+   * W 940/81 -> W_940.81-1
    */
   const batches = chunkArray(uniqueCodes, 20);
   const allHits = [];
@@ -770,28 +808,80 @@ async function getMannImages(
     allHits.push(...hits);
   }
 
-  const result = {};
+  const entries = await Promise.all(
+    uniqueCodes.map(async (mannCode) => {
+      const hit = findBestAssetHit(
+        allHits,
+        mannCode
+      );
 
-  for (const mannCode of uniqueCodes) {
-    const hit = findBestAssetHit(
-      allHits,
-      mannCode
-    );
-
-    result[mannCode] = hit
-      ? normalizeAssetHit(
+      if (hit) {
+        const normalizedHit = normalizeAssetHit(
           hit,
           mannCode,
           width
-        )
-      : {
+        );
+
+        if (normalizedHit.imageUrl) {
+          return [
+            mannCode,
+            {
+              ...normalizedHit,
+              source: "assets-api"
+            }
+          ];
+        }
+      }
+
+      const scene7Image =
+        await resolveScene7Fallback(
+          mannCode,
+          width
+        );
+
+      if (scene7Image) {
+        console.log(
+          "[MANN-IMG-SERVER] Imagen recuperada mediante Scene7",
+          {
+            mannCode,
+            scene7File:
+              scene7Image.scene7File,
+            imageUrl:
+              scene7Image.imageUrl
+          }
+        );
+
+        return [mannCode, scene7Image];
+      }
+
+      console.warn(
+        "[MANN-IMG-SERVER] No se encontró imagen",
+        {
+          mannCode,
+          candidates:
+            buildScene7AssetCandidates(
+              mannCode
+            )
+        }
+      );
+
+      return [
+        mannCode,
+        {
           mannCode,
           imageUrl: "",
-          found: false
-        };
-  }
+          found: false,
+          source: "missing",
+          scene7Candidates:
+            buildScene7AssetCandidates(
+              mannCode
+            )
+        }
+      ];
+    })
+  );
 
-  return result;
+  return Object.fromEntries(entries);
 }
 
 async function fetchMannAssetBatch(
@@ -986,10 +1076,33 @@ function normalizeAssetHit(
     scene7File &&
     scene7Domain
   ) {
-    imageUrl =
-      `${scene7Domain.replace(/\/+$/, "")}` +
-      `/is/image/${scene7File}` +
-      `?wid=${width}&fit=constrain`;
+    imageUrl = buildScene7ImageUrl(
+      scene7File,
+      width,
+      normalizeScene7BaseUrl(
+        scene7Domain
+      )
+    );
+  } else {
+    const directLink = cleanString(
+      hit?.link
+    );
+
+    if (
+      directLink &&
+      /(?:\/is\/image\/|\.(?:png|jpe?g|webp)(?:[?#]|$))/i.test(
+        directLink
+      )
+    ) {
+      try {
+        imageUrl = new URL(
+          directLink,
+          MANN_REFERER
+        ).toString();
+      } catch {
+        imageUrl = directLink;
+      }
+    }
   }
 
   return {
@@ -1022,6 +1135,351 @@ function normalizeAssetHit(
       hit?.metaData?.productReferences
     )
   };
+}
+
+async function resolveScene7Fallback(
+  mannCode,
+  width
+) {
+  const candidates =
+    buildScene7AssetCandidates(mannCode);
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  /*
+   * Se prueban los candidatos en paralelo para evitar
+   * multiplicar el tiempo de respuesta del endpoint.
+   * Promise.allSettled impide que un fallo individual
+   * de Scene7 rompa toda la consulta.
+   */
+  const checks = await Promise.allSettled(
+    candidates.map(async (scene7File) => ({
+      scene7File,
+      exists: await scene7AssetExists(
+        scene7File
+      )
+    }))
+  );
+
+  const firstExisting = checks
+    .map((result) =>
+      result.status === "fulfilled"
+        ? result.value
+        : null
+    )
+    .find((result) => result?.exists);
+
+  if (!firstExisting) {
+    return null;
+  }
+
+  return {
+    mannCode,
+    found: true,
+    source: "scene7-fallback",
+    imageUrl: buildScene7ImageUrl(
+      firstExisting.scene7File,
+      width
+    ),
+    uriTemplate: "",
+    link: "",
+    mimeType: "image/jpeg",
+    width: null,
+    height: null,
+    title: `Filtro MANN ${mannCode}`,
+    productView: "Front",
+    mainImage: true,
+    scene7File: firstExisting.scene7File,
+    productReferences: [
+      buildMannProductReference(mannCode)
+    ],
+    scene7Candidates: candidates
+  };
+}
+
+async function scene7AssetExists(
+  scene7File
+) {
+  const scene7Base =
+    normalizeScene7BaseUrl(
+      MANN_SCENE7_BASE
+    );
+
+  const normalizedFile =
+    normalizeScene7FileForBase(
+      scene7File,
+      scene7Base
+    );
+
+  const encodedFile = normalizedFile
+    .split("/")
+    .map((part) =>
+      encodeURIComponent(part)
+    )
+    .join("/");
+
+  const existsUrl = new URL(
+    `${scene7Base.replace(/\/+$/, "")}/${encodedFile}`
+  );
+
+  existsUrl.searchParams.set(
+    "req",
+    "exists"
+  );
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    Math.min(REQUEST_TIMEOUT_MS, 7000)
+  );
+
+  let response;
+
+  try {
+    response = await fetch(
+      existsUrl.toString(),
+      {
+        method: "GET",
+        headers: {
+          Accept: "text/plain,*/*",
+          Referer: MANN_REFERER,
+          "User-Agent":
+            "Mozilla/5.0 (compatible; Boxes-MANN-Service/1.2)"
+        },
+        signal: controller.signal,
+        next: {
+          revalidate: 86400
+        }
+      }
+    );
+  } catch (error) {
+    if (error?.name !== "AbortError") {
+      console.warn(
+        "[MANN-IMG-SERVER] Error verificando Scene7",
+        {
+          scene7File,
+          message: error?.message
+        }
+      );
+    }
+
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    return false;
+  }
+
+  const text = await response.text();
+
+  return parseScene7ExistsResponse(text);
+}
+
+function parseScene7ExistsResponse(
+  value
+) {
+  const text = cleanString(value);
+
+  if (!text) return false;
+
+  if (/^1$/.test(text)) return true;
+  if (/^true$/i.test(text)) return true;
+
+  if (
+    /(?:^|\b)exists\s*[:=]\s*(?:1|true)\b/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    /["']exists["']\s*:\s*(?:1|true)/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function normalizeScene7BaseUrl(
+  value
+) {
+  const base = cleanString(value).replace(
+    /\/+$/,
+    ""
+  );
+
+  if (!base) {
+    return MANN_SCENE7_BASE.replace(
+      /\/+$/,
+      ""
+    );
+  }
+
+  if (/\/is\/image\/[^/]+$/i.test(base)) {
+    return base;
+  }
+
+  if (/\/is\/image$/i.test(base)) {
+    return `${base}/mannhummel`;
+  }
+
+  return `${base}/is/image/mannhummel`;
+}
+
+function normalizeScene7FileForBase(
+  scene7File,
+  baseUrl
+) {
+  let file = cleanString(scene7File)
+    .replace(/^\/+/, "");
+
+  if (!file) return "";
+
+  try {
+    const base = new URL(baseUrl);
+    const company = base.pathname
+      .split("/")
+      .filter(Boolean)
+      .at(-1);
+
+    if (
+      company &&
+      file.toLowerCase().startsWith(
+        `${company.toLowerCase()}/`
+      )
+    ) {
+      file = file.slice(company.length + 1);
+    }
+  } catch {
+    // Si la base no es una URL válida, se conserva el archivo.
+  }
+
+  return file;
+}
+
+function buildScene7ImageUrl(
+  scene7File,
+  width,
+  baseUrl = MANN_SCENE7_BASE
+) {
+  const normalizedBase =
+    normalizeScene7BaseUrl(baseUrl);
+
+  const normalizedFile =
+    normalizeScene7FileForBase(
+      scene7File,
+      normalizedBase
+    );
+
+  const encodedFile = normalizedFile
+    .split("/")
+    .map((part) =>
+      encodeURIComponent(part)
+    )
+    .join("/");
+
+  const url = new URL(
+    `${normalizedBase.replace(/\/+$/, "")}/${encodedFile}`
+  );
+
+  url.searchParams.set(
+    "wid",
+    String(width)
+  );
+  url.searchParams.set(
+    "fit",
+    "constrain"
+  );
+  url.searchParams.set(
+    "qlt",
+    String(MANN_SCENE7_QUALITY)
+  );
+  url.searchParams.set("dpr", "off");
+
+  return url.toString();
+}
+
+function buildScene7AssetCandidates(
+  mannCode
+) {
+  const code = cleanString(mannCode)
+    .toUpperCase()
+    .replace(/_MANN-FILTER$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!code) return [];
+
+  const match = code.match(
+    /^([A-Z]+)\s*(.+)$/
+  );
+
+  if (!match) return [];
+
+  const prefix = match[1];
+  const remainder = match[2]
+    .replace(/^[-_.\s]+/, "")
+    .trim();
+
+  if (!remainder) return [];
+
+  const variants = uniqueStrings([
+    remainder
+      .replace(/\//g, ".")
+      .replace(/[\s_-]+/g, "."),
+
+    remainder
+      .replace(/\//g, ".")
+      .replace(/[\s-]+/g, "_"),
+
+    remainder
+      .replace(/\s+/g, "")
+      .replace(/\//g, "."),
+
+    remainder.replace(
+      /[^A-Z0-9]+/g,
+      "."
+    )
+  ])
+    .map((value) =>
+      value
+        .replace(/\.{2,}/g, ".")
+        .replace(/_{2,}/g, "_")
+        .replace(/^[._-]+|[._-]+$/g, "")
+    )
+    .filter(Boolean);
+
+  const candidates = [];
+
+  for (const variant of variants) {
+    const lowerSuffix = variant.replace(
+      /[A-Z]/g,
+      (letter) => letter.toLowerCase()
+    );
+
+    candidates.push(
+      `${prefix}_${variant}-1`
+    );
+
+    if (lowerSuffix !== variant) {
+      candidates.push(
+        `${prefix}_${lowerSuffix}-1`
+      );
+    }
+  }
+
+  return uniqueStrings(candidates).slice(
+    0,
+    8
+  );
 }
 
 function buildMannProductReference(
@@ -1200,6 +1658,24 @@ function normalizeVersion(item) {
   version.label = buildVersionLabel(version);
 
   return version;
+}
+
+function isValidCatalogFilter(item) {
+  if (!item) return false;
+
+  const normalizedCode =
+    normalizeFilterCode(
+      item.normalizedCode ||
+        item.mannCode ||
+        item.name ||
+        item.productIdentifier ||
+        item.sku
+    );
+
+  return Boolean(
+    normalizedCode &&
+      normalizedCode !== "NOFILTER"
+  );
 }
 
 function normalizeFilter(item) {
